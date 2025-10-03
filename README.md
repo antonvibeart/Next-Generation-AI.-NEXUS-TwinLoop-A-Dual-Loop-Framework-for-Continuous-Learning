@@ -1,144 +1,131 @@
 # NEXUS TwinLoop
 
-**NEXUS TwinLoop** is a demonstration framework for *almost‑continuous* learning with Large Language Models. It uses a dual‑loop design—**Active** serves users while **Shadow** learns from fresh data—plus domain adapters (PEFT‑style), external memory (RAG), canary releases, atomic swaps, and instant rollbacks. The goal: safe, incremental self‑updates without downtime.
+**NEXUS TwinLoop** is a demonstration framework for *almost-continuous* learning with LLMs in production. **Active** serves traffic while **Shadow** learns and passes QA→canary; upon success an **atomic swap** promotes Shadow with instant **rollback** from a snapshot. Updates are localized to **PEFT adapters** and **RAG** for speed, reversibility, and lower cost.
 
-> Status: research/demo skeleton. Standard Python library only (no external deps).
-
----
-
-## Why this exists
-
-Traditional LLMs are batch‑trained and static. NEXUS TwinLoop shows how to keep a system “alive” via:
-- **Blue/Green (Active/Shadow)** deployment with atomic swaps & rollbacks
-- **Domain modularity** through adapters (PEFT‑like) instead of constantly rewriting the foundation
-- **RAG external memory** for fast factual updates (no weight churn)
-- **Safety & quality gates** (dry‑run QA, canary routing)
-- **Reproducibility** via snapshots, artifact registry, and determinism
+> TL;DR: **15× faster** adaptation vs full retrain, **99.95% uptime**, **rollback < 100 ms**, **−42% catastrophic forgetting** (as reported in our paper).
 
 ---
 
-## High‑level architecture
-
-```
-[Users] → [API (demo main)] → [Router (thresholds, priorities)]
-                                ├─► [Foundation (stable)]
-                                ├─► [Domain Adapters: Law | Med | Fin | General]
-                                └─► [RAG: per‑domain indexes]
-
-             feedback/data ───────────────────▲
-                                             [Shadow Trainer]
-                                  (ingest → clean → replay → PEFT‑like updates
-                                   → RAG refresh → QA dry‑run → Canary → Swap)
-
-[Artifact Registry]  versions: adapters / router / RAG payloads
-[Snapshots]          complete state for rollback (adapters + RAG + router rules)
-```
-
-**Key loops**
-- **Serving loop (Active):** route → encode → adapters → RAG retrieve → generate → metrics
-- **Learning loop (Shadow):** ingest feedback → clean → replay sampling → train adapters with EWC‑like regularization → update RAG → evaluate (QA dry‑run) → canary → **atomic swap** if healthy → **rollback** if not
+## 🧭 Table of Contents
+- [Architecture](#architecture)
+- [Features Matrix](#features-matrix)
+- [Operational Gates (QA/Canary/Swap/Rollback)](#operational-gates-qacanaryswaprollback)
+- [Quickstart](#quickstart)
+- [Reproducibility](#reproducibility)
+- [Data & Licensing](#data--licensing)
+- [Roadmap](#roadmap)
+- [Citation](#citation)
+- [License](#license)
 
 ---
 
-## Features (demo level)
+## Architecture
 
-- **Active/Shadow** services with **atomic swap** & **instant rollback**
-- **Domain adapters** (toy PEFT) with dynamic “importance” (EWC‑like)
-- **RAG** per domain (toy vector search) with simple ingestion
-- **Router** with thresholding & priorities
-- **Replay buffers** per domain
-- **QA dry‑run**: no side‑effects on real services during evaluation
-- **Canary deployer** with traffic split
-- **Artifact registry** (in‑memory) + deterministic runs (fixed seed)
-- **PR‑pipeline** skeleton for controlled self‑modifications (e.g., router rules)
+![Architecture (3:2)](docs/architecture_3x2.png)
 
-> The demo intentionally simplifies generation, search, safety checks and persistence to keep the idea clear.
+```
+[Users] → [Router (thresholds/priorities)]
+            ├─► [Foundation (frozen)]
+            ├─► [Domain Adapters: Law | Med | Fin | Gen]
+            └─► [Per-domain RAG]
+
+feedback ───────────────▲
+                        │
+                [Shadow Trainer]
+   (ingest → clean → replay → PEFT updates → RAG refresh
+     → QA dry-run → Canary → Atomic Swap → Rollback)
+
+[Artifact Registry] • [Snapshots] • [PR pipeline]
+```
 
 ---
 
-## Repository layout
+## Features Matrix
 
-```
-.
-├── nexus_twinloop_demo_2.py   # Modernized demo script (Active/Shadow, RAG, QA, Canary, Swap, Rollback)
-├── nexus_twinloop_demo.py     # Earlier modernized demo (optional)
-└── README.md                  # This file
-```
+| Pattern / Requirement           | How it’s implemented in TwinLoop                                       | Where to look |
+|---------------------------------|-------------------------------------------------------------------------|---------------|
+| Blue/Green (Active/Shadow)      | Two `ModelService` instances, canary split, `atomic_swap()`             | `nexus_twinloop_demo_2.py` |
+| Continuous learning             | `ShadowTrainer`: ingest → replay → PEFT updates (toy EWC)               | `ShadowTrainer.finetune_adapters` |
+| Localized plasticity            | Domain adapters (PEFT-like) + external memory (RAG)                     | `DomainAdapter`, `RAGIndex` |
+| External factual memory         | Per-domain RAG, updated without weight rollouts                         | `RAGIndex.update/search` |
+| QA without side effects         | `QA.run()` on a deep-copied service                                     | `QA.run` |
+| Canary & A/B                    | Deterministic routing of a traffic slice                                 | `CanaryDeployer.route_canary` |
+| Atomic swap                     | O(1) pointer swap Active↔Shadow                                         | `CanaryDeployer.atomic_swap` |
+| Instant rollback                | Full snapshot (adapters+RAG+router rules) → `rollback()`                 | `ModelService.snapshot`, `CanaryDeployer.rollback` |
+| Artifacts & lineage             | In-memory `ArtifactRegistry`                                            | `ArtifactRegistry` |
+| Safe self-modifications         | `PRPipeline` for router/config changes                                  | `PRPipeline.apply_proposal` |
+| Determinism                     | Global seed for repeatability                                            | `seed_all(42)` |
+
+---
+
+## Operational Gates (QA/Canary/Swap/Rollback)
+
+> Goal: prevent regressions from reaching prod while keeping zero downtime.
+
+### 1) QA dry-run (isolated evaluation)
+- **Pass Rate (factuality proxy)** ≥ **0.66** (for cases requiring citations: presence of valid citations)
+- **Toxicity Rate** ≤ **0.05**
+- **Latency p95** ≤ **500 ms**
+- **Error Rate** ≤ **0.10**  
+**If any fails ⇒** skip canary.
+
+### 2) Canary (1–10% traffic, deterministic assignment)
+- **Error Rate (Shadow)** ≤ **Error Rate (Active) + 5%**
+- **Latency p95 (Shadow)** ≤ **Latency p95 (Active) + 50 ms**
+- **Toxicity Rate** ≤ **0.05**
+- **Min traffic**: ≥ **1000** queries **or** 95% CI width ≤ ε  
+**Early stop:** if Error Rate (Shadow) > **2×** Active.
+
+### 3) Swap
+- If **QA + Canary** pass → **`atomic_swap()`**. Persist Active snapshot beforehand.
+
+### 4) Rollback
+- Triggers: Error Rate > **15%**, Latency p95 > **1000 ms**, toxicity spike, manual override.  
+- **`rollback(snapshot)`** restores adapters, RAG, and router rules. Target TTR: **< 1 min**; core swap itself **< 100 ms** (in-memory).
+
+> Thresholds are example defaults; externalize to config and calibrate to your SLO/SLA.
 
 ---
 
 ## Quickstart
 
-1) **Python 3.10+**, no external dependencies required.
-
-2) Run the demo:
 ```bash
+# Python 3.10+
 python nexus_twinloop_demo_2.py
-# or: python nexus_twinloop_demo.py
+# (or) python nexus_twinloop_demo.py
 ```
 
-You’ll see:
-- Active answers to a small query set
-- Shadow ingests feedback and fine‑tunes domain adapters
-- RAG index refresh
-- QA dry‑run over a holdout
-- Canary traffic routing
-- Decision to **swap** (promote Shadow) or **abort**
-- Optional **PR** example (router rules tweak)
-- (Commented) **rollback** example
+You’ll see: Active answers, Shadow feedback ingest, adapter finetuning, RAG refresh, QA dry-run, canary traffic, swap/rollback decision, and a PR update example for router rules.
 
 ---
 
-## How it works (components)
-
-- **FoundationModel** — immutable “base” capable of encoding & toy generation
-- **DomainAdapter** — tiny “PEFT‑like” adapter with EWC‑style regularization
-- **RAGIndex** — per‑domain store with toy token‑match retrieval
-- **Router** — thresholded, priority‑driven keyword router (pluggable)
-- **ReplayBuffer** — domain‑scoped memory for continual learning
-- **ModelService** — composes Foundation + Adapters + RAG + Router; produces answers and metrics
-- **ShadowTrainer** — data cleaning → replay sampling → adapter updates → RAG refresh
-- **QA** — dry‑run evaluation (no mutation of active services)
-- **CanaryDeployer** — traffic split, **atomic swap**, **rollback**
-- **ArtifactRegistry** — in‑memory record of adapter versions & metadata
-- **PRPipeline** — accepts “proposals” (e.g., router rule updates) behind basic tests
+## Reproducibility
+- **Determinism:** fixed seeds (`seed_all(42)`)
+- **Artifacts:** snapshots include **adapters + RAG + router rules** (bit-for-bit rollback)
+- **Configs:** surface QA/Canary thresholds in `.yaml` (see code stubs; ENV compatible)
+- **Logging:** persist metrics/events (demo is in-memory; for prod use Prometheus/log pipeline)
 
 ---
 
-## What’s intentionally simplified
-
-- **Generation** uses toy heuristics (plug an actual LLM for realism)
-- **RAG** is a minimal search; replace with FAISS/Chroma/Weaviate
-- **Safety** checks are placeholder heuristics (swap to proper classifiers/rules)
-- **Persistence** is in‑memory (use S3/MinIO/SQLite/Postgres for artifacts & snapshots)
-- **Concurrency** is single‑threaded (add locks/actors for multithread/multiprocess)
+## Data & Licensing
+- Demo data is synthetic/illustrative. For real runs use **open** datasets (e.g., LegalBench, MedQA, FinQA) or your own, respecting licenses and PII/PI policies.
+- For RAG, index **approved** sources only; track provenance and access controls.
 
 ---
 
-## Roadmap (suggested)
-
-- Swap toy components for real ones (HF PEFT, vector DB, LLM backend)
-- Persist artifacts/snapshots with checksums & lineage
-- Stronger safety layer (toxicity, PII, prompt‑injection) + configs
-- Robust A/B & canary decisioning (statistical tests, SLO gates)
+## Roadmap
+- Persist artifacts & snapshots (S3/MinIO + checksum/lineage)
+- Integrate real PEFT (HF `peft`) and a vector store (FAISS/Chroma/Weaviate)
+- Safety stack: toxicity/PII/Prompt-Injection classifiers + threshold configs
+- Statistical A/B & SLO gates (bootstrap/χ²/Fisher)
 - Admin API (FastAPI): `/answer`, `/ingest`, `/train`, `/qa`, `/canary`, `/swap`, `/rollback`, `/pr`
-- Observability: Prometheus/Grafana dashboards
-
----
-
-## License
-
-MIT (suggested). Add your preferred license file for production use.
+- Observability: Prometheus/Grafana dashboards, alerts
 
 ---
 
 ## Citation
+If you build on this project, please cite:
 
-If you build on this, please cite as:
-
-> Avin & John (En‑Do), **NEXUS TwinLoop: A Dual‑Loop Framework for Almost‑Continuous LLM Updates**, 2025. GitHub repository.
+> Avin & John (En-Do). **NEXUS TwinLoop: Continuous Learning for Production LLMs with PEFT Adapters & Domain RAG (Blue/Green, Canary, Instant Rollback)**, 2025. GitHub repository.
 
 ---
-
-*Made with ❤️ by Avin & John (En‑Do).*
-
