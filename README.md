@@ -129,3 +129,4 @@ If you build on this project, please cite:
 > Avin & John (En-Do). **NEXUS TwinLoop: Continuous Learning for Production LLMs with PEFT Adapters & Domain RAG (Blue/Green, Canary, Instant Rollback)**, 2025. GitHub repository.
 
 ---
+https://ailawyer.ru/?page_id=111
